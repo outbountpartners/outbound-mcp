@@ -137,11 +137,24 @@ async function invokeTool(tool: ToolDef, args: Record<string, unknown>, apiKey: 
 // MCP method handlers
 // ---------------------------------------------------------------------------
 
+// Negotiate the protocol version: if the client requests a version we
+// support, echo it back. Otherwise advertise our latest and let the client
+// decide whether to proceed. Per MCP 2025-06-18 §4 (Initialization).
+const SUPPORTED_PROTOCOL_VERSIONS = ['2025-06-18', '2025-03-26', '2024-11-05'];
+
+function negotiateProtocolVersion(requested: unknown): string {
+  if (typeof requested === 'string' && SUPPORTED_PROTOCOL_VERSIONS.includes(requested)) {
+    return requested;
+  }
+  return MCP_PROTOCOL_VERSION;
+}
+
 async function handleRpcMessage(msg: JsonRpcRequest, apiKey: string | null, actingUser: string | null): Promise<object | null> {
   switch (msg.method) {
     case 'initialize': {
+      const requestedVersion = (msg.params as any)?.protocolVersion;
       return rpcResult(msg.id, {
-        protocolVersion: MCP_PROTOCOL_VERSION,
+        protocolVersion: negotiateProtocolVersion(requestedVersion),
         serverInfo: SERVER_INFO,
         capabilities: {
           tools: { listChanged: false },
@@ -173,11 +186,21 @@ async function handleRpcMessage(msg: JsonRpcRequest, apiKey: string | null, acti
       const args = (params.arguments ?? {}) as Record<string, unknown>;
       const tool = findTool(name);
       if (!tool) {
-        return rpcError(msg.id, -32602, `Unknown tool: ${name}`);
+        // MCP 2025-06-18 §6.5: "unknown tool" is a tool-execution error, not a
+        // protocol error. Return a successful JSON-RPC result with isError=true.
+        return rpcResult(msg.id, {
+          content: [
+            {
+              type: 'text',
+              text: `Unknown tool: ${name}. Use tools/list to discover the available tools.`,
+            },
+          ],
+          isError: true,
+        });
       }
       const result = await invokeTool(tool, args, apiKey, actingUser);
       // MCP content envelope: text content with the JSON payload.
-      return rpcResult(msg.id, {
+      const envelope: Record<string, unknown> = {
         content: [
           {
             type: 'text',
@@ -185,8 +208,13 @@ async function handleRpcMessage(msg: JsonRpcRequest, apiKey: string | null, acti
           },
         ],
         isError: result.isError,
-        structuredContent: typeof result.body === 'object' && result.body !== null ? result.body : undefined,
-      });
+      };
+      // Only attach structuredContent on success (non-error) responses; per
+      // spec it represents the structured tool result, not error payloads.
+      if (!result.isError && typeof result.body === 'object' && result.body !== null) {
+        envelope.structuredContent = result.body;
+      }
+      return rpcResult(msg.id, envelope);
     }
 
     case 'resources/list':
@@ -200,9 +228,31 @@ async function handleRpcMessage(msg: JsonRpcRequest, apiKey: string | null, acti
   }
 }
 
+// Generate a stateless session id. We don't actually maintain server-side
+// session state — the id exists only because clients like Claude Desktop
+// expect to see it in the response and echo it back on subsequent requests.
+function makeSessionId(): string {
+  return crypto.randomUUID();
+}
+
 // ---------------------------------------------------------------------------
 // HTTP server
 // ---------------------------------------------------------------------------
+
+// Determine which session id to emit on the response. If the client sent
+// Mcp-Session-Id, echo it back (cooperative). Otherwise, on `initialize`
+// requests we mint a new one.
+function pickSessionId(req: Request, body: unknown): string | null {
+  const existing = req.headers.get('mcp-session-id');
+  if (existing) return existing;
+
+  // Mint only on initialize.
+  const isInitialize = (msg: any) => msg && typeof msg === 'object' && msg.method === 'initialize';
+  if (Array.isArray(body) ? body.some(isInitialize) : isInitialize(body)) {
+    return makeSessionId();
+  }
+  return null;
+}
 
 Deno.serve(async (req: Request) => {
   if (req.method === 'OPTIONS') return new Response('ok', { headers: corsHeaders });
@@ -216,6 +266,7 @@ Deno.serve(async (req: Request) => {
       ok: true,
       message: 'Outbound Partners MCP server',
       protocol: MCP_PROTOCOL_VERSION,
+      supported_protocol_versions: SUPPORTED_PROTOCOL_VERSIONS,
       transport: 'streamable-http',
       server: SERVER_INFO,
       auth: { header: 'x-api-key', alternative: 'Authorization: Bearer <key>' },
@@ -229,8 +280,14 @@ Deno.serve(async (req: Request) => {
     return jsonResponse(toolsListResponse());
   }
 
+  // DELETE on the session endpoint terminates a session. We're stateless so
+  // this is a no-op, but advertise + handle it for MCP-spec-strict clients.
+  if (req.method === 'DELETE') {
+    return new Response(null, { status: 204, headers: corsHeaders });
+  }
+
   if (req.method !== 'POST') {
-    return jsonResponse({ error: 'POST required for MCP JSON-RPC messages' }, 405);
+    return jsonResponse({ error: 'POST required for MCP JSON-RPC messages' }, 405, { Allow: 'GET, POST, DELETE, OPTIONS' });
   }
 
   const apiKey = extractApiKey(req);
@@ -247,6 +304,10 @@ Deno.serve(async (req: Request) => {
 
   if (!body) return jsonResponse(rpcError(null, -32600, 'Invalid Request'), 400);
 
+  // Build extra response headers (Mcp-Session-Id per MCP 2025-06-18 §4.6).
+  const sessionId = pickSessionId(req, body);
+  const sessionHeaders: Record<string, string> = sessionId ? { 'Mcp-Session-Id': sessionId } : {};
+
   // Batch handling
   if (Array.isArray(body)) {
     const responses: object[] = [];
@@ -259,8 +320,8 @@ Deno.serve(async (req: Request) => {
       if (result) responses.push(result);
     }
     // All-notifications batch → 204
-    if (responses.length === 0) return new Response(null, { status: 204, headers: corsHeaders });
-    return jsonResponse(responses);
+    if (responses.length === 0) return new Response(null, { status: 204, headers: { ...corsHeaders, ...sessionHeaders } });
+    return jsonResponse(responses, 200, sessionHeaders);
   }
 
   // Single message
@@ -270,7 +331,7 @@ Deno.serve(async (req: Request) => {
   }
 
   const result = await handleRpcMessage(msg, apiKey, actingUser);
-  if (!result) return new Response(null, { status: 204, headers: corsHeaders });
+  if (!result) return new Response(null, { status: 204, headers: { ...corsHeaders, ...sessionHeaders } });
 
-  return jsonResponse(result);
+  return jsonResponse(result, 200, sessionHeaders);
 });
