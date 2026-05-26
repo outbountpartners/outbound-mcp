@@ -165,7 +165,7 @@ export const TOOLS: ToolDef[] = [
   // Clients
   {
     name: 'clients_list',
-    description: 'List clients. Default returns Active only; pass status=Inactive or status=all to see others.',
+    description: 'List clients. Default returns Active only; pass status=Inactive or status=all to see others. Supports renewal_status + renewal_within_days for churn-risk queries.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -173,12 +173,14 @@ export const TOOLS: ToolDef[] = [
         client_type: { type: 'string', enum: ['client', 'internal'] },
         industry: { type: 'string' },
         parent_client_id: uuidSchema,
+        renewal_status: { type: 'string', enum: ['Pending', 'Renewed', 'Did not renew'], description: 'Filter by renewal_status.' },
+        renewal_within_days: { type: 'integer', minimum: 0, maximum: 3650, description: 'Only clients whose renewal_date is non-null and ≤ today+N days (useful for churn-risk reports).' },
         search: { type: 'string', description: 'ILIKE on name' },
         ...paginationProps,
       },
       additionalProperties: false,
     },
-    http: { method: 'GET', pathTemplate: '/v1/clients', queryParams: ['status', 'client_type', 'industry', 'parent_client_id', 'search', 'limit', 'offset'] },
+    http: { method: 'GET', pathTemplate: '/v1/clients', queryParams: ['status', 'client_type', 'industry', 'parent_client_id', 'renewal_status', 'renewal_within_days', 'search', 'limit', 'offset'] },
     annotations: { readOnlyHint: true },
   },
   {

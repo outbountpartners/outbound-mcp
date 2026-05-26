@@ -48,16 +48,16 @@ Scopes are enforced server-side by the v1 API based on the key's permissions. If
 
 ## Connect from clients
 
-### Claude Desktop
+### Claude Desktop / Claude Code
 
-Edit `claude_desktop_config.json`:
+Edit `claude_desktop_config.json` (Desktop) or `.mcp.json` in your project root (Code):
 
 ```json
 {
   "mcpServers": {
     "outbound-partners": {
+      "type": "http",
       "url": "https://sirhkzqpdgarrcyqnjtl.supabase.co/functions/v1/mcp",
-      "transport": "http",
       "headers": {
         "x-api-key": "opk_live_..."
       }
@@ -65,6 +65,8 @@ Edit `claude_desktop_config.json`:
   }
 }
 ```
+
+> **Field name:** Use `"type": "http"` — NOT `"transport": "http"`. Claude Code/Desktop silently ignore entries that use the wrong key.
 
 ### ChatGPT (with MCP support)
 
